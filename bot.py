@@ -49,16 +49,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply = f"❌ Something went wrong: {e}"
 
     await thinking_msg.delete()
-    await update.message.reply_text(reply, parse_mode="Markdown")
+    await update.message.reply_text(reply)
 
 
 async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "I only understand text messages. Try:\n"
-        "• _How many campers are registered?_\n"
-        "• _Show unpaid registrations_\n"
-        "• _Analyze photo john\\_doe.jpg_",
-        parse_mode="Markdown"
+        "• How many campers are registered?\n"
+        "• Show unpaid registrations\n"
+        "• Analyze photo john_doe.jpg"
     )
 
 

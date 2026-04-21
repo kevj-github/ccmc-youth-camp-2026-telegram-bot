@@ -1,6 +1,9 @@
 import os
-import json
 import logging
+import asyncio
+import uvicorn
+from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from gemini_handler import ask_gemini
@@ -18,7 +21,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
+WEBHOOK_URL = os.environ["WEBHOOK_URL"]
 ALLOWED_CHAT_IDS = list(map(int, os.environ.get("ALLOWED_CHAT_IDS", "").split(",")))
+PORT = int(os.environ.get("PORT", 8000))
+
+bot_app = Application.builder().token(TELEGRAM_TOKEN).build()
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -26,7 +33,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
 
     if ALLOWED_CHAT_IDS and chat_id not in ALLOWED_CHAT_IDS:
-        logger.warning(f"Unauthorized access attempt from chat_id={chat_id}")
+        logger.warning(f"Unauthorized access from chat_id={chat_id}")
         await update.message.reply_text("⛔ You are not authorized to use this bot.")
         return
 
@@ -38,7 +45,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         reply = ask_gemini(text)
     except Exception as e:
-        logger.error(f"Error from Claude: {e}", exc_info=True)
+        logger.error(f"Error from Gemini: {e}", exc_info=True)
         reply = f"❌ Something went wrong: {e}"
 
     await thinking_msg.delete()
@@ -47,7 +54,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "I only understand text messages. Type something like:\n"
+        "I only understand text messages. Try:\n"
         "• _How many campers are registered?_\n"
         "• _Show unpaid registrations_\n"
         "• _Analyze photo john\\_doe.jpg_",
@@ -55,14 +62,37 @@ async def handle_unknown(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
-def main():
-    logger.info("Starting Youth Camp Bot...")
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.add_handler(MessageHandler(~filters.TEXT, handle_unknown))
-    logger.info("Bot is running. Press Ctrl+C to stop.")
-    app.run_polling(drop_pending_updates=True)
+bot_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+bot_app.add_handler(MessageHandler(~filters.TEXT, handle_unknown))
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup
+    await bot_app.initialize()
+    await bot_app.bot.set_webhook(f"{WEBHOOK_URL}/webhook")
+    logger.info(f"Webhook set to {WEBHOOK_URL}/webhook")
+    yield
+    # Shutdown
+    await bot_app.bot.delete_webhook()
+    await bot_app.shutdown()
+
+
+app = FastAPI(lifespan=lifespan)
+
+
+@app.post("/webhook")
+async def webhook(request: Request):
+    data = await request.json()
+    update = Update.de_json(data, bot_app.bot)
+    await bot_app.process_update(update)
+    return {"ok": True}
+
+
+@app.get("/")
+async def health():
+    return {"status": "running"}
 
 
 if __name__ == "__main__":
-    main()
+    uvicorn.run(app, host="0.0.0.0", port=PORT)

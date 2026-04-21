@@ -35,18 +35,21 @@ read_sheet_fn = FunctionDeclaration(
 
 write_sheet_fn = FunctionDeclaration(
     name="write_sheet",
-    description="Write or update specific cells in the Google Sheet.",
+    description="Write or update specific cells in the Google Sheet. values is a 2D array e.g. [['Paid'], ['Paid']] for a single column.",
     parameters={
         "type": "object",
         "properties": {
             "range": {
                 "type": "string",
-                "description": "Cell range in A1 notation, e.g. 'Sheet1!B2' or 'Sheet1!C2:C5'"
+                "description": "Cell range in A1 notation, e.g. Sheet1!B2 or Sheet1!C2:C5"
             },
             "values": {
                 "type": "array",
-                "description": "2D array of values to write. E.g. [['Paid'], ['Paid']]",
-                "items": {"type": "array"}
+                "description": "2D array of string values to write.",
+                "items": {
+                    "type": "array",
+                    "items": {"type": "string"}
+                }
             }
         },
         "required": ["range", "values"]
@@ -124,14 +127,13 @@ def handle_tool(name: str, args: dict) -> str:
         img_bytes = base64.b64decode(img_b64)
         img = PIL.Image.open(io.BytesIO(img_bytes))
 
-        # Use Gemini vision inline (no sub-model needed — same model handles vision)
         vision_response = model.generate_content([
             "You are analyzing an image uploaded via a youth camp registration form. "
             "Describe what you see in detail. Note any names, dates, signatures, "
             "payment info, or anything relevant to camp administration.",
             img
         ])
-        return f"Analysis of *{match['name']}*:\n{vision_response.text}"
+        return f"Analysis of {match['name']}:\n{vision_response.text}"
 
     return f"Unknown tool: {name}"
 
@@ -140,7 +142,6 @@ def ask_gemini(user_message: str) -> str:
     chat = model.start_chat()
     response = chat.send_message(user_message)
 
-    # Agentic loop — keep calling tools until Gemini gives a text response
     while True:
         part = response.candidates[0].content.parts[0]
 
@@ -148,7 +149,6 @@ def ask_gemini(user_message: str) -> str:
             fc = part.function_call
             result = handle_tool(fc.name, dict(fc.args))
 
-            # Send tool result back to Gemini
             response = chat.send_message(
                 genai.protos.Content(parts=[
                     genai.protos.Part(
@@ -160,5 +160,4 @@ def ask_gemini(user_message: str) -> str:
                 ])
             )
         else:
-            # Plain text response — we're done
             return response.text

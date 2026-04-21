@@ -5,6 +5,8 @@ from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
 from gemini_handler import ask_gemini
 
+os.makedirs("logs", exist_ok=True)
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,

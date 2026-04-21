@@ -72,8 +72,7 @@ async def lifespan(app: FastAPI):
     await bot_app.bot.set_webhook(f"{WEBHOOK_URL}/webhook")
     logger.info(f"Webhook set to {WEBHOOK_URL}/webhook")
     yield
-    # Shutdown
-    await bot_app.bot.delete_webhook()
+    # Shutdown — do NOT delete the webhook here, Render restarts shouldn't break it
     await bot_app.shutdown()
 
 

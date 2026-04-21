@@ -31,9 +31,19 @@ _drive_service = None
 def _get_creds():
     global _creds
     if _creds is None:
-        _creds = service_account.Credentials.from_service_account_file(
-            SERVICE_ACCOUNT_FILE, scopes=SCOPES
-        )
+        creds_json = os.environ.get("GOOGLE_CREDENTIALS_JSON")
+        if creds_json:
+            # Render: credentials passed as env var
+            import json
+            info = json.loads(creds_json)
+            _creds = service_account.Credentials.from_service_account_info(
+                info, scopes=SCOPES
+            )
+        else:
+            # Local: credentials from file
+            _creds = service_account.Credentials.from_service_account_file(
+                SERVICE_ACCOUNT_FILE, scopes=SCOPES
+            )
     if not _creds.valid:
         _creds.refresh(Request())
     return _creds

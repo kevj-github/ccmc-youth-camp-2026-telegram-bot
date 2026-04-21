@@ -3,7 +3,7 @@ import json
 import logging
 from telegram import Update
 from telegram.ext import Application, MessageHandler, filters, ContextTypes
-from claude_handler import ask_claude
+from gemini_handler import ask_gemini
 
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -34,7 +34,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     thinking_msg = await update.message.reply_text("⏳ Thinking...")
 
     try:
-        reply = ask_claude(text)
+        reply = ask_gemini(text)
     except Exception as e:
         logger.error(f"Error from Claude: {e}", exc_info=True)
         reply = f"❌ Something went wrong: {e}"

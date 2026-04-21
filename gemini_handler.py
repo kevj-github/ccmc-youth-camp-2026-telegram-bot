@@ -26,21 +26,37 @@ genai.configure(api_key=os.environ["GEMINI_API_KEY"])
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 
 SYSTEM_PROMPT = f"""You are a helpful assistant managing a youth camp.
-You have access to the camp's Google Sheet (registration data) and a Google Drive folder (PayNow payment receipts uploaded via Google Form).
+You have access to the camp's Google Sheet (registration data from a Google Form) and the linked Google Drive folder (PayNow payment receipts).
 
-The sheet tab is called '{SHEET_NAME}' — always use this as the sheet name in A1 notation (e.g. {SHEET_NAME}!B2).
+Sheet tab name: '{SHEET_NAME}'
+
+The sheet has these columns (from the Google Form):
+- Timestamp
+- Full Name (e.g., Kevin Saputra)
+- Preferred Name (e.g., Kevin)
+- Age
+- Phone Number
+- Emergency Contact Number
+- Preferred Language
+- Dietary Restriction/Allergy
+- Youth Camp T-Shirt Size
+- Preferred Payment Method (e.g. Paynow full, Paynow partial)
+- Payment Proof URL(s) — Google Drive link(s) to the PayNow screenshot. Multiple uploads separated by ", "
+
+Important about payment proofs:
+- The "Payment Proof" column contains Google Drive URLs (like https://drive.google.com/open?id=ABC123), NOT filenames.
+- A camper may upload MULTIPLE images — their cell will contain multiple URLs separated by ", ".
+- To analyze a camper's payment: read_sheet, find the camper by name, then call analyze_payment_proof with the ENTIRE contents of their payment proof cell (all URLs at once, don't split them yourself). The tool will analyze each image and sum the amounts automatically.
 
 Guidelines:
 - Keep replies concise and friendly — this is a Telegram chat
 - The first row of the sheet is always the header
-- When editing cells, ALWAYS call read_sheet first if you need to know column positions or row numbers
-- When adding a new column (e.g. "Fees paid"), use add_column — don't manually write to an empty column
-- The analyze_image tool is designed for PayNow receipts — it extracts the amount paid and validates the image.
-  If it returns "not a valid PayNow receipt" or "no amount", relay that to the user verbatim — do NOT guess the amount.
-- If unsure which image the user means, call list_images first
-- Never expose raw JSON or cell coordinates — summarize in plain language
-- If a user asks to modify data, confirm what you did (which row/column) after the action
-- Do NOT use markdown formatting like *bold* or _italic_ — plain text only, Telegram will display it as-is"""
+- When editing cells, call read_sheet first to know column positions/row numbers
+- When adding a new column, use add_column — don't manually write to an empty cell
+- When asked about someone's payment, search by their name in the sheet, grab their payment proof URL(s), and analyze each
+- If analyze_payment_proof says "not a valid PayNow receipt", relay that verbatim — do NOT guess the amount
+- Do NOT use markdown formatting (*bold*, _italic_) — plain text only
+- When reporting amounts, include the camper's name and which row they're in"""
 
 # ── Tool definitions ──────────────────────────────────────────────────
 read_sheet_fn = FunctionDeclaration(
@@ -97,22 +113,30 @@ list_images_fn = FunctionDeclaration(
     parameters={"type": "object", "properties": {}}
 )
 
-analyze_image_fn = FunctionDeclaration(
-    name="analyze_image",
+analyze_payment_proof_fn = FunctionDeclaration(
+    name="analyze_payment_proof",
     description=(
-        "Download and analyze a PayNow payment screenshot from Google Drive. "
-        "Returns the transferred amount, recipient, date, and reference number if found. "
-        "Flags the image if it's not a valid payment receipt."
+        "Analyze PayNow payment screenshot(s) from the 'Payment Proof' column of the sheet. "
+        "Handles both single URLs and multiple URLs separated by ', ' (when a camper uploaded "
+        "multiple images). Returns per-image breakdown AND the total amount paid across all images."
     ),
     parameters={
         "type": "object",
         "properties": {
-            "file_name": {
+            "drive_urls_or_ids": {
                 "type": "string",
-                "description": "The exact or partial filename of the image in Google Drive"
+                "description": (
+                    "The full content of the payment proof cell — can be a single Drive URL, "
+                    "a raw file ID, or multiple URLs separated by ', '. "
+                    "Copy the cell contents directly from the sheet."
+                )
+            },
+            "camper_name": {
+                "type": "string",
+                "description": "Optional — the camper's name, just for context in the reply."
             }
         },
-        "required": ["file_name"]
+        "required": ["drive_urls_or_ids"]
     }
 )
 
@@ -136,7 +160,7 @@ camp_tools = Tool(function_declarations=[
     write_sheet_fn,
     append_row_fn,
     list_images_fn,
-    analyze_image_fn,
+    analyze_payment_proof_fn,
     add_column_fn,
 ])
 
@@ -174,6 +198,77 @@ def _stringify_values(values):
         else:
             result.append([str(v) if v is not None else "" for v in row])
     return result
+
+
+def _extract_drive_file_ids(text: str) -> list[str]:
+    """Extract all Drive file IDs from a string that may contain multiple URLs."""
+    if not text:
+        return []
+    ids = []
+    # Match URLs with ?id= or &id=
+    ids.extend(re.findall(r"[?&]id=([a-zA-Z0-9_-]+)", text))
+    # Match /file/d/FILE_ID
+    ids.extend(re.findall(r"/file/d/([a-zA-Z0-9_-]+)", text))
+    # If nothing matched but the input looks like a raw ID, use it
+    if not ids:
+        for token in re.split(r"[,\s]+", text.strip()):
+            token = token.strip()
+            if re.fullmatch(r"[a-zA-Z0-9_-]{20,}", token):
+                ids.append(token)
+    # Dedupe while preserving order
+    seen = set()
+    result = []
+    for fid in ids:
+        if fid not in seen:
+            seen.add(fid)
+            result.append(fid)
+    return result
+
+
+def _analyze_single_proof(file_id: str) -> dict:
+    """Download and analyze a single PayNow image. Returns parsed JSON dict (with error fields on failure)."""
+    try:
+        img_b64, _ = get_image_base64(file_id)
+        img_bytes = base64.b64decode(img_b64)
+        img = PIL.Image.open(io.BytesIO(img_bytes))
+        img.load()
+    except Exception as e:
+        return {"error": f"Could not download/read image: {e}"}
+
+    paynow_prompt = (
+        "You are verifying a PayNow payment screenshot for a youth camp registration fee. "
+        "Analyze this image and respond ONLY with a JSON object (no markdown, no extra text) "
+        "in this exact format:\n\n"
+        "{\n"
+        '  "is_paynow_receipt": true|false,\n'
+        '  "amount": <number or null>,\n'
+        '  "currency": "SGD" or other code or null,\n'
+        '  "recipient_name": "<name or null>",\n'
+        '  "date": "<date string or null>",\n'
+        '  "reference": "<transaction ref or null>",\n'
+        '  "confidence": "high"|"medium"|"low",\n'
+        '  "issue": "<description of what is wrong, or null if receipt is valid>"\n'
+        "}\n\n"
+        "Rules:\n"
+        "- is_paynow_receipt=false if the image is NOT a PayNow/bank transfer receipt.\n"
+        "- amount=null if you cannot clearly read a numeric amount.\n"
+        "- confidence=low if blurry or partial.\n"
+        "- Be strict. If you're not sure, mark is_paynow_receipt=false."
+    )
+
+    try:
+        vision_response = model.generate_content([paynow_prompt, img])
+        raw = (vision_response.text or "").strip()
+    except ResourceExhausted:
+        return {"error": "Rate limited"}
+    except Exception as e:
+        return {"error": f"Vision error: {e}"}
+
+    cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        return {"error": f"Could not parse response: {raw[:200]}"}
 
 
 def _send_with_retry(chat, message, max_retries=3):
@@ -237,106 +332,93 @@ def handle_tool(name: str, args: dict) -> str:
                 [f"• {f['name']}" for f in files]
             )
 
-        elif name == "analyze_image":
-            query = args.get("file_name", "").lower().strip()
-            if not query:
-                return "Error: file_name is required."
-            files = list_drive_images()
-            if not files:
-                return "There are no images in the Drive folder."
-            match = next((f for f in files if query in f["name"].lower()), None)
-            if not match:
-                available = ", ".join(f["name"] for f in files[:10])
-                more = f" (and {len(files) - 10} more)" if len(files) > 10 else ""
-                return f"Image '{args['file_name']}' not found. Available: {available}{more}"
+        elif name == "analyze_payment_proof":
+            raw_input = args.get("drive_urls_or_ids", "").strip()
+            camper_name = args.get("camper_name", "").strip()
+            if not raw_input:
+                return "Error: drive_urls_or_ids is required."
 
-            img_b64, mime_type = get_image_base64(match["id"])
-            try:
-                img_bytes = base64.b64decode(img_b64)
-                img = PIL.Image.open(io.BytesIO(img_bytes))
-                img.load()
-            except Exception as e:
-                return f"⚠️ Could not read image '{match['name']}': {e}. The file may be corrupted or not a real image."
+            file_ids = _extract_drive_file_ids(raw_input)
+            if not file_ids:
+                return f"Could not extract any Drive file ID from '{raw_input[:200]}'. Please provide a valid Drive URL, file ID, or comma-separated list."
 
-            # Strict PayNow receipt analysis with JSON output
-            paynow_prompt = (
-                "You are verifying a PayNow payment screenshot for a youth camp registration fee. "
-                "Analyze this image and respond ONLY with a JSON object (no markdown, no explanation outside the JSON) "
-                "in this exact format:\n\n"
-                "{\n"
-                '  "is_paynow_receipt": true|false,\n'
-                '  "amount": <number or null>,\n'
-                '  "currency": "SGD" or other code or null,\n'
-                '  "recipient_name": "<name or null>",\n'
-                '  "date": "<date string or null>",\n'
-                '  "reference": "<transaction ref or null>",\n'
-                '  "confidence": "high"|"medium"|"low",\n'
-                '  "issue": "<description of what is wrong, or null if receipt is valid>"\n'
-                "}\n\n"
-                "Rules:\n"
-                "- Set is_paynow_receipt=false if the image is NOT a PayNow/bank transfer receipt "
-                "(e.g. it's a photo, form, document, screenshot of something else, or blank).\n"
-                "- Set amount=null if you cannot clearly read a numeric amount.\n"
-                "- Set confidence=low if the image is blurry, partial, or hard to read.\n"
-                "- Explain in 'issue' if something is wrong (wrong image type, no amount visible, "
-                "looks fake, amount unclear, etc.) — otherwise set issue=null.\n"
-                "- Be strict. If you're not sure it's a real PayNow receipt, say is_paynow_receipt=false."
-            )
+            who = f" for {camper_name}" if camper_name else ""
 
-            try:
-                vision_response = model.generate_content([paynow_prompt, img])
-                raw = (vision_response.text or "").strip()
-            except ResourceExhausted:
-                return f"Rate limit hit while analyzing {match['name']}. Please try again in a minute."
+            # Analyze each image
+            results = []
+            for fid in file_ids:
+                results.append(_analyze_single_proof(fid))
 
-            # Strip markdown code fences if Gemini wraps the JSON
-            cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", raw, flags=re.MULTILINE).strip()
+            # Build report
+            total = 0.0
+            valid_count = 0
+            invalid_count = 0
+            unreadable_count = 0
+            error_count = 0
+            currency = ""
+            lines = [f"📋 Payment proof analysis{who} ({len(file_ids)} image{'s' if len(file_ids) != 1 else ''}):\n"]
 
-            try:
-                data = json.loads(cleaned)
-            except json.JSONDecodeError:
-                return (
-                    f"⚠️ Could not parse payment info from '{match['name']}'.\n"
-                    f"Raw AI response:\n{raw[:500]}"
-                )
+            for i, data in enumerate(results, 1):
+                header_line = f"Image {i}:"
 
-            # Build a human-friendly summary from the structured data
-            is_receipt = data.get("is_paynow_receipt")
-            amount = data.get("amount")
-            currency = data.get("currency") or ""
-            recipient = data.get("recipient_name")
-            date = data.get("date")
-            ref = data.get("reference")
-            confidence = data.get("confidence", "unknown")
-            issue = data.get("issue")
+                if "error" in data:
+                    lines.append(f"{header_line} ⚠️ {data['error']}")
+                    error_count += 1
+                    continue
 
-            if not is_receipt:
-                return (
-                    f"❌ '{match['name']}' does NOT appear to be a valid PayNow receipt.\n"
-                    f"Issue: {issue or 'Not identified as a payment screenshot'}\n"
-                    f"Please ask the camper to re-upload their actual payment screenshot."
-                )
+                is_receipt = data.get("is_paynow_receipt")
+                amount = data.get("amount")
+                cur = data.get("currency") or ""
+                recipient = data.get("recipient_name")
+                date = data.get("date")
+                ref = data.get("reference")
+                conf = data.get("confidence", "unknown")
+                issue = data.get("issue")
 
-            if amount is None:
-                return (
-                    f"⚠️ '{match['name']}' looks like a payment screenshot but no amount could be read.\n"
-                    f"Issue: {issue or 'Amount not visible or illegible'}\n"
-                    f"Confidence: {confidence}\n"
-                    f"Please review the image manually or request a clearer screenshot."
-                )
+                if not is_receipt:
+                    lines.append(f"{header_line} ❌ NOT a valid PayNow receipt ({issue or 'wrong image type'})")
+                    invalid_count += 1
+                    continue
 
-            # Valid receipt with amount
-            lines = [f"✅ PayNow receipt detected for '{match['name']}':"]
-            lines.append(f"Amount: {currency} {amount}".strip())
-            if recipient:
-                lines.append(f"Recipient: {recipient}")
-            if date:
-                lines.append(f"Date: {date}")
-            if ref:
-                lines.append(f"Reference: {ref}")
-            lines.append(f"Confidence: {confidence}")
-            if issue:
-                lines.append(f"⚠️ Note: {issue}")
+                if amount is None:
+                    lines.append(f"{header_line} ⚠️ Receipt detected but amount unreadable ({issue or 'unclear'}, confidence: {conf})")
+                    unreadable_count += 1
+                    continue
+
+                # Valid receipt with amount
+                valid_count += 1
+                try:
+                    total += float(amount)
+                except (TypeError, ValueError):
+                    pass
+                if cur and not currency:
+                    currency = cur
+
+                detail = f"{header_line} ✅ {cur} {amount}".strip()
+                extras = []
+                if recipient:
+                    extras.append(f"to {recipient}")
+                if date:
+                    extras.append(date)
+                if ref:
+                    extras.append(f"ref {ref}")
+                if extras:
+                    detail += f" ({', '.join(extras)})"
+                if conf != "high":
+                    detail += f" [confidence: {conf}]"
+                lines.append(detail)
+
+            # Summary
+            lines.append("")
+            lines.append("─" * 20)
+            if valid_count > 0:
+                lines.append(f"💰 Total valid payments: {currency} {total:g}".strip())
+            lines.append(f"✅ Valid: {valid_count}  ❌ Invalid: {invalid_count}  ⚠️ Unreadable: {unreadable_count}  ⛔ Errors: {error_count}")
+
+            if invalid_count or unreadable_count:
+                lines.append("")
+                lines.append("⚠️ Some images had issues — please review manually or ask camper to re-upload.")
+
             return "\n".join(lines)
 
         return f"Unknown tool: {name}"
